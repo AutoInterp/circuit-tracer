@@ -52,6 +52,8 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
+    measurement_layer: int | None = None,
+    measurement_position: int | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using TransformerLens backend.
 
@@ -75,6 +77,10 @@ def attribute(
                  or None (no offloading).
         verbose: Whether to show progress information.
         update_interval: Number of batches to process before updating the feature ranking.
+        measurement_layer: Transformer layer at which to measure attribution.
+            ``None`` means the post-transformer (unembed) layer (default).
+        measurement_position: Token position at which to measure attribution.
+            ``None`` means the last token position (default).
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -106,6 +112,8 @@ def attribute(
             verbose=verbose,
             offload_handles=offload_handles,
             update_interval=update_interval,
+            measurement_layer=measurement_layer,
+            measurement_position=measurement_position,
             logger=logger,
         )
     finally:
@@ -129,6 +137,8 @@ def _run_attribution(
     offload_handles,
     logger,
     update_interval=4,
+    measurement_layer: int | None = None,
+    measurement_position: int | None = None,
 ):
     start_time = time.time()
     # Phase 0: precompute
@@ -193,11 +203,14 @@ def _run_attribution(
     # Phase 3: logit attribution
     logger.info("Phase 3: Computing logit attributions")
     phase_start = time.time()
+    # addition for refusal lens
+    _ml = n_layers if measurement_layer is None else measurement_layer
+    _mp = n_pos - 1 if measurement_position is None else measurement_position
     for i in range(0, len(targets), batch_size):
         batch = targets.logit_vectors[i : i + batch_size]
         rows = ctx.compute_batch(
-            layers=torch.full((batch.shape[0],), n_layers),
-            positions=torch.full((batch.shape[0],), n_pos - 1),
+            layers=torch.full((batch.shape[0],), _ml),
+            positions=torch.full((batch.shape[0],), _mp),
             inject_values=batch,
         )
         edge_matrix[i : i + batch.shape[0], :logit_offset] = rows.cpu()

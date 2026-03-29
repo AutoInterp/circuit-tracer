@@ -29,6 +29,8 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
+    measurement_layer: int | None = None,
+    measurement_position: int | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -55,6 +57,10 @@ def attribute(
                  or None (no offloading).
         verbose: Whether to show progress information.
         update_interval: Number of batches to process before updating the feature ranking.
+        measurement_layer: Transformer layer at which to measure attribution.
+            ``None`` means the post-transformer (unembed) layer (default).
+        measurement_position: Token position at which to measure attribution.
+            ``None`` means the last token position (default).
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -74,6 +80,8 @@ def attribute(
             offload=offload,
             verbose=verbose,
             update_interval=update_interval,
+            measurement_layer=measurement_layer,
+            measurement_position=measurement_position,
         )
     else:
         from .attribute_transformerlens import attribute as attribute_transformerlens
@@ -89,4 +97,6 @@ def attribute(
             offload=offload,
             verbose=verbose,
             update_interval=update_interval,
+            measurement_layer=measurement_layer,
+            measurement_position=measurement_position,
         )
