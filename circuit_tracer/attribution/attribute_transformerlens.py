@@ -40,6 +40,27 @@ from circuit_tracer.replacement_model.replacement_model_transformerlens import (
 from circuit_tracer.utils.disk_offload import offload_modules
 
 
+def _as_measurement_tensor(
+    value: "int | Sequence[int] | None",
+    n_targets: int,
+    default: int,
+    name: str,
+) -> torch.Tensor:
+    """Normalize ``measurement_layer`` / ``measurement_position`` into a
+    ``(n_targets,)`` long tensor. See the nnsight backend for semantics."""
+    if value is None:
+        return torch.full((n_targets,), default, dtype=torch.long)
+    if isinstance(value, int):
+        return torch.full((n_targets,), value, dtype=torch.long)
+    t = torch.as_tensor(list(value), dtype=torch.long)
+    if t.ndim != 1 or t.shape[0] != n_targets:
+        raise ValueError(
+            f"{name}: expected int or sequence of length {n_targets} "
+            f"(matching the number of attribution targets); got shape {tuple(t.shape)}"
+        )
+    return t
+
+
 def attribute(
     prompt: str | torch.Tensor | list[int],
     model: TransformerLensReplacementModel,
@@ -52,8 +73,8 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
-    measurement_layer: int | None = None,
-    measurement_position: int | None = None,
+    measurement_layer: int | Sequence[int] | None = None,
+    measurement_position: int | Sequence[int] | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using TransformerLens backend.
 
@@ -79,8 +100,11 @@ def attribute(
         update_interval: Number of batches to process before updating the feature ranking.
         measurement_layer: Transformer layer at which to measure attribution.
             ``None`` means the post-transformer (unembed) layer (default).
+            ``int`` applies to every target; ``Sequence[int]`` with length
+            matching ``len(targets)`` assigns per-target layers.
         measurement_position: Token position at which to measure attribution.
-            ``None`` means the last token position (default).
+            ``None`` means the last token position (default). ``int`` applies
+            to every target; ``Sequence[int]`` assigns per-target positions.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -137,8 +161,8 @@ def _run_attribution(
     offload_handles,
     logger,
     update_interval=4,
-    measurement_layer: int | None = None,
-    measurement_position: int | None = None,
+    measurement_layer: int | Sequence[int] | None = None,
+    measurement_position: int | Sequence[int] | None = None,
 ):
     start_time = time.time()
     # Phase 0: precompute
@@ -203,14 +227,19 @@ def _run_attribution(
     # Phase 3: logit attribution
     logger.info("Phase 3: Computing logit attributions")
     phase_start = time.time()
-    # addition for refusal lens
-    _ml = n_layers if measurement_layer is None else measurement_layer
-    _mp = n_pos - 1 if measurement_position is None else measurement_position
+    # addition for refusal-lens — per-target measurement sinks. See the
+    # nnsight backend for docs; this is the same shape transformation.
+    _ml_tensor = _as_measurement_tensor(
+        measurement_layer, len(targets), n_layers, "measurement_layer",
+    )
+    _mp_tensor = _as_measurement_tensor(
+        measurement_position, len(targets), n_pos - 1, "measurement_position",
+    )
     for i in range(0, len(targets), batch_size):
         batch = targets.logit_vectors[i : i + batch_size]
         rows = ctx.compute_batch(
-            layers=torch.full((batch.shape[0],), _ml),
-            positions=torch.full((batch.shape[0],), _mp),
+            layers=_ml_tensor[i : i + batch.shape[0]],
+            positions=_mp_tensor[i : i + batch.shape[0]],
             inject_values=batch,
         )
         edge_matrix[i : i + batch.shape[0], :logit_offset] = rows.cpu()

@@ -29,8 +29,8 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
-    measurement_layer: int | None = None,
-    measurement_position: int | None = None,
+    measurement_layer: "int | Sequence[int] | None" = None,
+    measurement_position: "int | Sequence[int] | None" = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -59,8 +59,14 @@ def attribute(
         update_interval: Number of batches to process before updating the feature ranking.
         measurement_layer: Transformer layer at which to measure attribution.
             ``None`` means the post-transformer (unembed) layer (default).
+            ``int`` applies to every target.
+            ``Sequence[int]`` must match ``len(targets)`` after CustomTarget
+            expansion, assigning a per-target layer — used when attributing to
+            several residual-stream locations in one backward pass.
         measurement_position: Token position at which to measure attribution.
             ``None`` means the last token position (default).
+            ``int`` applies to every target. ``Sequence[int]`` must match
+            ``len(targets)``; see measurement_layer.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
