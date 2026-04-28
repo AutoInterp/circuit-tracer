@@ -56,6 +56,10 @@ class AttributionContext:
 
         # Forward-pass cache
         self._resid_activations: list[torch.Tensor] = []
+        # Optional alternative measurement-point cache (e.g. resid_post[L]
+        # when measurement_hook="hook_resid_post"). Same length as
+        # _resid_activations; only populated if a measurement_hook is set.
+        self._measurement_resid_activations: list[torch.Tensor] = []
         self._feature_output_activations: list[torch.Tensor] = []
         self._batch_buffer: torch.Tensor | None = None
         self.n_layers: int = n_layers
@@ -73,13 +77,51 @@ class AttributionContext:
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
 
-    def cache_residual(self, model: "NNSightReplacementModel", tracer, barrier=None):
-        """Cache the model's residual for use in the attribution context."""
+    def cache_residual(
+        self,
+        model: "NNSightReplacementModel",
+        tracer,
+        barrier=None,
+        measurement_hook: str | None = None,
+    ):
+        """Cache the model's residual for use in the attribution context.
+
+        Args:
+            model: The replacement model.
+            tracer: nnsight tracer.
+            barrier: optional nnsight barrier.
+            measurement_hook: if set (e.g. "hook_resid_post"), additionally cache
+                that hook's output for every layer into ``_measurement_resid_activations``.
+                The cotangent will be injected at this cache instead of the default
+                feature_input cache. Used to attribute against an arbitrary residual
+                stream point rather than the transcoder's training input.
+        """
         with tracer.invoke():
-            for feature_input_loc in model.feature_input_locs:
+            # nnsight requires module accesses in forward-execution order.
+            # For each layer L, the feature_input_loc (pre_ff_LN.output[L]) is
+            # reached BEFORE the measurement_loc (input_LN.input[L+1]) in the
+            # forward pass — so we interleave them.
+            for layer in range(self.n_layers):
+                feature_input_loc = model.get_feature_input_loc(layer)
                 self._resid_activations.append(feature_input_loc.output)  # type: ignore
 
+                if measurement_hook is not None:
+                    loc = model.get_measurement_loc(layer, measurement_hook)
+                    # `.clone()` creates a NEW node in the autograd graph that
+                    # nnsight tracks first-class (the raw .input proxy doesn't
+                    # populate .grad after backward). retain_grad ensures .grad
+                    # survives the intermediate-tensor pruning.
+                    t = loc.output.clone()  # type: ignore
+                    t.retain_grad()
+                    self._measurement_resid_activations.append(t)
+
             self._resid_activations.append(model.pre_logit_location.output.last_hidden_state)  # type: ignore
+
+            if measurement_hook is not None:
+                # last entry (n_layers-th): post-final-norm so measurement_layer=n_layers still works
+                t_last = model.pre_logit_location.output.last_hidden_state  # type: ignore
+                t_last.retain_grad()
+                self._measurement_resid_activations.append(t_last)
 
         with tracer.invoke():
             self._feature_output_activations.append(model.embed_location.output)  # type: ignore
@@ -154,6 +196,7 @@ class AttributionContext:
         positions: torch.Tensor,
         inject_values: torch.Tensor,
         retain_graph: bool = True,
+        use_measurement_cache: bool = False,
     ) -> torch.Tensor:
         """Return attribution rows for a batch of (layer, pos) nodes.
 
@@ -165,6 +208,10 @@ class AttributionContext:
             positions: 1-D tensor of token positions *c* for the source nodes.
             inject_values: `(batch, d_model)` tensor with outer product
                 a_s * W^(enc/dec) to inject as custom gradient.
+            use_measurement_cache: if True, inject the cotangent into
+                ``_measurement_resid_activations[layer]`` (e.g. resid_post[L])
+                instead of ``_resid_activations[layer]``. Requires that
+                ``cache_residual`` was called with a non-None ``measurement_hook``.
 
         Returns:
             torch.Tensor: ``(batch, row_size)`` matrix - one row per node.
@@ -189,12 +236,34 @@ class AttributionContext:
         layers_in_batch = sorted(layers.unique().tolist(), reverse=True)
 
         last_layer = max(layers_in_batch)
-        with self._resid_activations[last_layer].backward(
-            gradient=torch.zeros_like(self._resid_activations[last_layer]),
+
+        # Pick where backward starts (= measurement point) and where to inject.
+        # Default: feature_input cache (mlp.hook_in[L]). With measurement_hook,
+        # use the alternative cache (e.g. resid_post[L]).
+        if use_measurement_cache:
+            if not self._measurement_resid_activations:
+                raise RuntimeError(
+                    "use_measurement_cache=True but _measurement_resid_activations is empty; "
+                    "cache_residual was not called with a measurement_hook."
+                )
+            backward_start = self._measurement_resid_activations[last_layer]
+            inject_targets = self._measurement_resid_activations
+        else:
+            backward_start = self._resid_activations[last_layer]
+            inject_targets = self._resid_activations
+
+        with backward_start.backward(
+            gradient=torch.zeros_like(backward_start),
             retain_graph=retain_graph,
         ):
             for layer in reversed(range(last_layer + 1)):
-                if layer != last_layer:
+                # In the default (mlp.hook_in) setup, features at last_layer
+                # are downstream of the cotangent so their gradient is zero —
+                # skip to avoid noise. In the measurement_hook setup
+                # (resid_post[L]), features at last_layer DO contribute (they
+                # add to MLP_last_layer's output, which adds to resid_post),
+                # so we MUST capture their grad.
+                if layer != last_layer or use_measurement_cache:
                     grad = self._feature_output_activations[layer + 1].grad.clone()  # type:ignore
                     self.compute_feature_attributions(layer, grad)
                     self.compute_error_attributions(layer, grad)
@@ -202,7 +271,7 @@ class AttributionContext:
                 mask = layers == layer
                 if mask.any():
                     _inject(
-                        grad_point=self._resid_activations[layer],
+                        grad_point=inject_targets[layer],
                         batch_indices=batch_idx[mask],
                         pos_indices=positions[mask],
                         values=inject_values[mask],

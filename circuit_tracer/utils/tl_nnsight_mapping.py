@@ -68,6 +68,12 @@ gemma_3_mapping = TransformerLens_NNSight_Mapping(
         "hook_resid_mid": ("model.layers[{layer}].pre_feedforward_layernorm", "input"),
         "mlp.hook_in": ("model.layers[{layer}].pre_feedforward_layernorm", "output"),
         "hook_mlp_out": ("model.layers[{layer}].post_feedforward_layernorm", "output"),
+        # hook_resid_pre = residual stream at the start of layer L = input_layernorm.input.
+        # NB: hook_resid_post[L] = hook_resid_pre[L+1] for L < n_layers - 1; for the
+        # last layer, hook_resid_post is resolved in get_measurement_loc to the
+        # final norm's input. Adding hook_resid_pre here lets get_measurement_loc
+        # implement hook_resid_post via "look up the next layer's resid_pre".
+        "hook_resid_pre": ("model.layers[{layer}].input_layernorm", "input"),
     },
 )
 
@@ -95,6 +101,8 @@ gemma_3_conditional_mapping = TransformerLens_NNSight_Mapping(
         "hook_resid_mid": ("language_model.layers[{layer}].pre_feedforward_layernorm", "input"),
         "mlp.hook_in": ("language_model.layers[{layer}].pre_feedforward_layernorm", "output"),
         "hook_mlp_out": ("language_model.layers[{layer}].post_feedforward_layernorm", "output"),
+        # See note in gemma_3_mapping about hook_resid_pre vs hook_resid_post.
+        "hook_resid_pre": ("language_model.layers[{layer}].input_layernorm", "input"),
     },
 )
 

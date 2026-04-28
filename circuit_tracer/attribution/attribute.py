@@ -31,6 +31,7 @@ def attribute(
     update_interval: int = 4,
     measurement_layer: int | None = None,
     measurement_position: int | None = None,
+    measurement_hook: str | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -61,6 +62,12 @@ def attribute(
             ``None`` means the post-transformer (unembed) layer (default).
         measurement_position: Token position at which to measure attribution.
             ``None`` means the last token position (default).
+        measurement_hook: Optional alternative TL hook name (e.g.
+            ``"hook_resid_post"``) at which to inject the cotangent. Default
+            ``None`` uses the transcoder's ``feature_input_hook``. Used to
+            attribute against a residual-stream direction rather than the
+            transcoder-input post-RMSNorm point. Only supported by the
+            nnsight backend.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -82,6 +89,7 @@ def attribute(
             update_interval=update_interval,
             measurement_layer=measurement_layer,
             measurement_position=measurement_position,
+            measurement_hook=measurement_hook,
         )
     else:
         from .attribute_transformerlens import attribute as attribute_transformerlens
@@ -99,4 +107,5 @@ def attribute(
             update_interval=update_interval,
             measurement_layer=measurement_layer,
             measurement_position=measurement_position,
+            measurement_hook=measurement_hook,
         )

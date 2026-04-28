@@ -58,6 +58,9 @@ class AttributionContext:
 
         # Forward-pass cache
         self._resid_activations: list[torch.Tensor | None] = [None] * (n_layers + 1)
+        # Optional alternative measurement-point cache (e.g. hook_resid_post[L]
+        # when measurement_hook is set). Same length as _resid_activations.
+        self._measurement_resid_activations: list[torch.Tensor | None] = [None] * (n_layers + 1)
         self._batch_buffer: torch.Tensor | None = None
         self.n_layers: int = n_layers
 
@@ -74,8 +77,20 @@ class AttributionContext:
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
 
-    def _caching_hooks(self, feature_input_hook: str) -> list[tuple[str, Callable]]:
-        """Return hooks that store residual activations layer-by-layer."""
+    def _caching_hooks(
+        self,
+        feature_input_hook: str,
+        measurement_hook: str | None = None,
+    ) -> list[tuple[str, Callable]]:
+        """Return hooks that store residual activations layer-by-layer.
+
+        Args:
+            feature_input_hook: TL hook name read by the transcoders (e.g. "mlp.hook_in").
+                Cached into ``_resid_activations``.
+            measurement_hook: Optional alternative TL hook name (e.g. "hook_resid_post")
+                at which to cache an extra residual stream point for cotangent
+                injection. Cached into ``_measurement_resid_activations``.
+        """
 
         proxy = weakref.proxy(self)
 
@@ -83,11 +98,23 @@ class AttributionContext:
             proxy._resid_activations[layer] = acts
             return acts
 
-        hooks = [
+        def _cache_measurement(acts: torch.Tensor, hook: HookPoint, *, layer: int) -> torch.Tensor:
+            proxy._measurement_resid_activations[layer] = acts
+            return acts
+
+        hooks: list[tuple[str, Callable]] = [
             (f"blocks.{layer}.{feature_input_hook}", partial(_cache, layer=layer))
             for layer in range(self.n_layers)
         ]
         hooks.append(("unembed.hook_pre", partial(_cache, layer=self.n_layers)))
+
+        if measurement_hook is not None:
+            hooks.extend(
+                (f"blocks.{layer}.{measurement_hook}", partial(_cache_measurement, layer=layer))
+                for layer in range(self.n_layers)
+            )
+            # mirror the post-stack entry so measurement_layer=n_layers also works
+            hooks.append(("unembed.hook_pre", partial(_cache_measurement, layer=self.n_layers)))
         return hooks
 
     def _compute_score_hook(
@@ -157,10 +184,17 @@ class AttributionContext:
         return feature_hooks + error_hooks + token_hook
 
     @contextlib.contextmanager
-    def install_hooks(self, model: "TransformerLensReplacementModel"):
+    def install_hooks(
+        self,
+        model: "TransformerLensReplacementModel",
+        measurement_hook: str | None = None,
+    ):
         """Context manager instruments the hooks for the forward and backward passes."""
         with model.hooks(
-            fwd_hooks=self._caching_hooks(model.feature_input_hook),  # type: ignore
+            fwd_hooks=self._caching_hooks(
+                model.feature_input_hook,  # type: ignore
+                measurement_hook=measurement_hook,
+            ),
             bwd_hooks=self._make_attribution_hooks(model.feature_output_hook),  # type: ignore
         ):
             yield
@@ -171,6 +205,7 @@ class AttributionContext:
         positions: torch.Tensor,
         inject_values: torch.Tensor,
         retain_graph: bool = True,
+        use_measurement_cache: bool = False,
     ) -> torch.Tensor:
         """Return attribution rows for a batch of (layer, pos) nodes.
 
@@ -182,6 +217,10 @@ class AttributionContext:
             positions: 1-D tensor of token positions *c* for the source nodes.
             inject_values: `(batch, d_model)` tensor with outer product
                 a_s * W^(enc/dec) to inject as custom gradient.
+            use_measurement_cache: if True, inject the cotangent into the
+                ``_measurement_resid_activations`` cache (e.g. hook_resid_post[L])
+                instead of the default ``_resid_activations`` cache. Requires
+                ``install_hooks`` was called with a non-None ``measurement_hook``.
 
         Returns:
             torch.Tensor: ``(batch, row_size)`` matrix - one row per node.
@@ -203,6 +242,16 @@ class AttributionContext:
             grads_out.index_put_((batch_indices, pos_indices), values)
             return grads_out.to(grads.dtype)
 
+        if use_measurement_cache:
+            inject_targets = self._measurement_resid_activations
+            if inject_targets[0] is None:
+                raise RuntimeError(
+                    "use_measurement_cache=True but _measurement_resid_activations is empty; "
+                    "install_hooks was not called with a measurement_hook."
+                )
+        else:
+            inject_targets = self._resid_activations
+
         handles = []
         layers_in_batch = layers.unique().tolist()
 
@@ -216,12 +265,12 @@ class AttributionContext:
                 pos_indices=positions[mask],
                 values=inject_values[mask],
             )
-            handles.append(self._resid_activations[int(layer)].register_hook(fn))  # type: ignore
+            handles.append(inject_targets[int(layer)].register_hook(fn))  # type: ignore
 
         try:
             last_layer = max(layers_in_batch)
-            self._resid_activations[last_layer].backward(
-                gradient=torch.zeros_like(self._resid_activations[last_layer]),
+            inject_targets[last_layer].backward(  # type: ignore
+                gradient=torch.zeros_like(inject_targets[last_layer]),  # type: ignore
                 retain_graph=retain_graph,
             )
         finally:

@@ -99,11 +99,19 @@ class SingleLayerTranscoder(nn.Module):
         """Dynamically load weights when accessed if lazy loading is enabled."""
 
         if name == "W_enc" and self.lazy_encoder and self.transcoder_path is not None:
-            with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
-                return f.get_tensor("W_enc").to(self.dtype)
+            # safetensors-rust only accepts "cpu" or "cuda:N"; for mps/xpu/etc.
+            # load to CPU then move with .to().
+            load_dev = str(self.device)
+            if not (load_dev == "cpu" or load_dev.startswith("cuda")):
+                load_dev = "cpu"
+            with safe_open(self.transcoder_path, framework="pt", device=load_dev) as f:
+                return f.get_tensor("W_enc").to(self.device, self.dtype)
         elif name == "W_dec" and self.lazy_decoder and self.transcoder_path is not None:
-            with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
-                return f.get_tensor("W_dec").to(self.dtype)
+            load_dev = str(self.device)
+            if not (load_dev == "cpu" or load_dev.startswith("cuda")):
+                load_dev = "cpu"
+            with safe_open(self.transcoder_path, framework="pt", device=load_dev) as f:
+                return f.get_tensor("W_dec").to(self.device, self.dtype)
 
         return super().__getattr__(name)
 
@@ -114,8 +122,11 @@ class SingleLayerTranscoder(nn.Module):
 
         if isinstance(to_read, torch.Tensor):
             to_read = to_read.cpu()
-        with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
-            return f.get_slice("W_dec")[to_read].to(self.dtype)
+        load_dev = str(self.device)
+        if not (load_dev == "cpu" or load_dev.startswith("cuda")):
+            load_dev = "cpu"
+        with safe_open(self.transcoder_path, framework="pt", device=load_dev) as f:
+            return f.get_slice("W_dec")[to_read].to(self.device, self.dtype)
 
     def encode(self, input_acts, apply_activation_function: bool = True):
         W_enc = self.W_enc
@@ -452,8 +463,11 @@ def load_relu_transcoder(
     if device is None:
         device = get_default_device()
 
+    load_dev = str(device)
+    if not (load_dev == "cpu" or load_dev.startswith("cuda")):
+        load_dev = "cpu"
     param_dict = {}
-    with safe_open(path, framework="pt", device=str(device)) as f:
+    with safe_open(path, framework="pt", device=load_dev) as f:
         for k in f.keys():
             if lazy_encoder and k == "W_enc":
                 continue
@@ -519,7 +533,10 @@ def load_gemma_scope_2_transcoder(
         lazy_encoder = False
         lazy_decoder = False
 
-    with safe_open(path, framework="pt", device=device.type) as f:
+    load_dev = device.type
+    if not (load_dev == "cpu" or load_dev == "cuda"):
+        load_dev = "cpu"
+    with safe_open(path, framework="pt", device=load_dev) as f:
         state_dict = {k: f.get_tensor(k) for k in f.keys()}
 
     param_dict = {

@@ -238,6 +238,10 @@ class NNSightReplacementModel(LanguageModel):
             transcoder_set.feature_output_hook
         ]
 
+        # Stash the full feature_hook_mapping so attribute() can look up
+        # alternative measurement hooks (e.g. "hook_resid_post") on demand.
+        self._feature_hook_mapping = nnsight_config.feature_hook_mapping
+
         self._attention_pattern = nnsight_config.attention_location_pattern
         # Ensure we consistently store LayerNorm scale patterns as a list.
         self._layernorm_scale_patterns = nnsight_config.layernorm_scale_location_patterns
@@ -980,6 +984,48 @@ class NNSightReplacementModel(LanguageModel):
         return EnvoyWrapper(
             self._resolve_attr(self, self._feature_input_pattern.format(layer=layer)),
             self._feature_input_io,  # type: ignore
+        )
+
+    def get_measurement_loc(self, layer: int, measurement_hook: str):
+        """Resolve an alternative measurement hook (e.g. "hook_resid_post") for a given layer.
+
+        Used by attribute() to inject the cotangent at a residual-stream point
+        rather than at the transcoder's feature_input_hook.
+
+        Special-case: "hook_resid_post" is resolved as the input of the next
+        layer's input_layernorm (= resid_post[layer]). For the last layer it
+        becomes the input of the final norm.
+        """
+        n_layers = self.cfg.n_layers  # type: ignore
+
+        if measurement_hook == "hook_resid_post":
+            if layer < n_layers - 1:
+                if "hook_resid_pre" not in self._feature_hook_mapping:
+                    raise ValueError(
+                        "hook_resid_post requires hook_resid_pre to be defined in "
+                        f"the mapping for {self.config.architectures[0]}"
+                    )
+                pattern, io = self._feature_hook_mapping["hook_resid_pre"]
+                return EnvoyWrapper(
+                    self._resolve_attr(self, pattern.format(layer=layer + 1)),
+                    io,
+                )
+            # last layer: input to the final norm of pre_logit_location
+            final_norm_path = self._pre_logit_location + ".norm"
+            return EnvoyWrapper(
+                self._resolve_attr(self, final_norm_path),
+                "input",
+            )
+
+        if measurement_hook not in self._feature_hook_mapping:
+            raise ValueError(
+                f"measurement_hook={measurement_hook!r} not in feature_hook_mapping for "
+                f"this architecture. Available: {list(self._feature_hook_mapping.keys())}"
+            )
+        pattern, io = self._feature_hook_mapping[measurement_hook]
+        return EnvoyWrapper(
+            self._resolve_attr(self, pattern.format(layer=layer)),
+            io,
         )
 
     @property
