@@ -220,9 +220,17 @@ def _run_attribution(
     use_measurement_cache = measurement_hook is not None
     for i in range(0, len(targets), batch_size):
         batch = targets.logit_vectors[i : i + batch_size]
+        # _mp may be a scalar (broadcast across all targets) or a per-target
+        # sequence (one position per CustomTarget — used by the multi-position
+        # measurement pass). compute_batch wants a 1-D tensor of length B.
+        positions = (
+            torch.as_tensor(_mp[i : i + batch.shape[0]], dtype=torch.long)
+            if isinstance(_mp, (list, tuple))
+            else torch.full((batch.shape[0],), _mp)
+        )
         rows = ctx.compute_batch(
             layers=torch.full((batch.shape[0],), _ml),
-            positions=torch.full((batch.shape[0],), _mp),
+            positions=positions,
             inject_values=batch,
             use_measurement_cache=use_measurement_cache,
         )
