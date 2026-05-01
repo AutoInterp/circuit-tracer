@@ -141,8 +141,13 @@ qwen_3_mapping = TransformerLens_NNSight_Mapping(
     embed_weight="model.embed_tokens.weight",
     unembed_weight="lm_head.weight",
     feature_hook_mapping={
+        "hook_resid_mid": ("model.layers[{layer}].post_attention_layernorm", "input"),
         "mlp.hook_in": ("model.layers[{layer}].post_attention_layernorm", "output"),
         "mlp.hook_out": ("model.layers[{layer}].mlp", "output"),
+        # See note in gemma_3_mapping about hook_resid_pre vs hook_resid_post.
+        # Qwen3 uses the standard pre-LN block: input_layernorm sits at the
+        # start of the layer, so its input == residual stream at start of L.
+        "hook_resid_pre": ("model.layers[{layer}].input_layernorm", "input"),
     },
 )
 
